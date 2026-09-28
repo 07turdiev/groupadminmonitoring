@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import time
+import zlib
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from html import escape
 
@@ -21,6 +23,7 @@ from aiogram.types import (
     Message,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
+    User,
 )
 
 import config
@@ -33,38 +36,73 @@ router = Router()
 
 GROUP_TYPES = {ChatType.GROUP, ChatType.SUPERGROUP}
 ADMIN_CACHE_TTL = 600
-_admin_cache: dict[int, tuple[float, set[int]]] = {}
 
 
-async def get_admin_ids(bot: Bot, chat_id: int) -> set[int]:
+@dataclass
+class Admins:
+    ids: set[int]
+    # Anonim adminlar unvoni bo'yicha: {"Elbek": [User], "": [unvonsizlar]}
+    anonymous: dict[str, list[User]]
+
+
+@dataclass
+class Author:
+    id: int
+    name: str
+    username: str | None
+    is_admin: bool
+
+
+_admin_cache: dict[int, tuple[float, Admins]] = {}
+
+
+async def get_admins(bot: Bot, chat_id: int) -> Admins:
     cached = _admin_cache.get(chat_id)
     if cached and cached[0] > time.monotonic():
         return cached[1]
     try:
         members = await bot.get_chat_administrators(chat_id)
-        ids = {m.user.id for m in members if not m.user.is_bot}
     except Exception:
         log.exception("Adminlar ro'yxatini olib bo'lmadi: %s", chat_id)
-        ids = cached[1] if cached else set()
-    _admin_cache[chat_id] = (time.monotonic() + ADMIN_CACHE_TTL, ids)
-    return ids
+        admins = cached[1] if cached else Admins(set(), {})
+    else:
+        admins = Admins({m.user.id for m in members if not m.user.is_bot}, {})
+        for m in members:
+            if getattr(m, "is_anonymous", False) and not m.user.is_bot:
+                admins.anonymous.setdefault(getattr(m, "custom_title", None) or "", []).append(m.user)
+    _admin_cache[chat_id] = (time.monotonic() + ADMIN_CACHE_TTL, admins)
+    return admins
 
 
 def chat_allowed(chat_id: int) -> bool:
     return not config.ALLOWED_CHATS or chat_id in config.ALLOWED_CHATS
 
 
-def author_id(message: Message) -> int | None:
-    """Xabar muallifi ID si. Anonim admin uchun — guruh ID si. Kanal/bot xabarlari uchun None."""
+def pseudo_id(title: str) -> int:
+    """Akkaunti aniqlanmagan anonim admin uchun unvon bo'yicha doimiy ID (Telegram ID lari bilan to'qnashmaydi)."""
+    return -10**15 - zlib.crc32(title.encode())
+
+
+async def get_author(bot: Bot, message: Message) -> Author | None:
+    """Xabar muallifi. Kanal nomidan va botlar yozgan xabarlar uchun None."""
+    chat_id = message.chat.id
     if message.sender_chat:
-        return message.chat.id if message.sender_chat.id == message.chat.id else None
-    if message.from_user and not message.from_user.is_bot:
-        return message.from_user.id
-    return None
-
-
-async def is_admin(bot: Bot, message: Message, uid: int) -> bool:
-    return uid == message.chat.id or uid in await get_admin_ids(bot, message.chat.id)
+        if message.sender_chat.id != chat_id:
+            return None
+        # Anonim admin: Telegram faqat uning unvonini (author_signature) beradi,
+        # haqiqiy akkauntini adminlar ro'yxatidan shu unvon orqali topamiz
+        title = message.author_signature or ""
+        matches = (await get_admins(bot, chat_id)).anonymous.get(title, [])
+        if len(matches) == 1:
+            return Author(matches[0].id, matches[0].full_name, matches[0].username, True)
+        log.info("Anonim admin aniqlanmadi: unvon=%r, mos adminlar=%d", title, len(matches))
+        if title:
+            return Author(pseudo_id(title), f"Anonim admin «{title}»", None, True)
+        return Author(chat_id, "Anonim admin", None, True)
+    user = message.from_user
+    if not user or user.is_bot:
+        return None
+    return Author(user.id, user.full_name, user.username, user.id in (await get_admins(bot, chat_id)).ids)
 
 
 def real_reply(message: Message) -> Message | None:
@@ -180,30 +218,27 @@ def message_text(message: Message) -> str:
         text = f"[{media}] {text}".strip()
     return text
 
+
 @router.message(F.chat.type.in_(GROUP_TYPES))
 async def track(message: Message, bot: Bot) -> None:
     if not chat_allowed(message.chat.id):
         return
-    uid = author_id(message)
-    if uid is None:
+    author = await get_author(bot, message)
+    if author is None:
         return
 
     db.save_chat(message.chat.id, message.chat.title or str(message.chat.id))
-    if message.from_user and uid == message.from_user.id:
-        db.save_user(uid, message.from_user.full_name, message.from_user.username)
-    else:
-        db.save_user(uid, "Anonim admin", None)
-
+    db.save_user(author.id, author.name, author.username)
     ts = int(message.date.timestamp())
 
-    if await is_admin(bot, message, uid):
+    if author.is_admin:
         reply = real_reply(message)
         if reply is None:
             return
-        reply_author = author_id(reply)
-        if reply_author is None or await is_admin(bot, message, reply_author):
+        asker = await get_author(bot, reply)
+        if asker is None or asker.is_admin:
             return  # adminlar o'rtasidagi yozishma yoki bot xabariga javob
-        db.add_reply(message.chat.id, message.message_id, uid, reply.message_id, ts, message_text(message))
+        db.add_reply(message.chat.id, message.message_id, author.id, reply.message_id, ts, message_text(message))
         return
 
     text = message.text or message.caption or ""
@@ -211,7 +246,7 @@ async def track(message: Message, bot: Bot) -> None:
         return
     if config.QUESTION_MODE == "mark" and "?" not in text:
         return
-    db.add_question(message.chat.id, message.message_id, uid, ts, message_text(message))
+    db.add_question(message.chat.id, message.message_id, author.id, ts, message_text(message))
 
 
 # ---------------------------------------------------------------- avtomatik hisobotlar

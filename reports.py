@@ -38,8 +38,6 @@ def period_bounds(kind: str, previous: bool = False, now: datetime | None = None
     else:
         raise ValueError(kind)
 
-    if not previous:
-        end = min(end, now)
     return start, end, label
 
 

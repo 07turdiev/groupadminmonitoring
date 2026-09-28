@@ -10,7 +10,12 @@ kunlik / haftalik / oylik hisobot beradi.
 - Savolga birinchi reply qilgan admin savolni "yopgan" hisoblanadi (**savollar** ustuni),
   adminning barcha reply xabarlari **javoblar** ustunida.
 - O'rtacha javob vaqti — savol yozilgandan birinchi admin reply qilgunicha.
-- Adminlar ro'yxati Telegramdan avtomatik olinadi (10 daqiqada yangilanadi). Anonim adminlar "Anonim admin" deb ko'rsatiladi.
+- Adminlar ro'yxati Telegramdan avtomatik olinadi (10 daqiqada yangilanadi).
+- **Anonim adminlar** — Telegram ularning xabarida faqat admin unvonini (custom title) beradi. Bot shu unvon orqali
+  adminlar ro'yxatidan haqiqiy akkauntni topadi va hisobotda adminning Telegram ismini ko'rsatadi.
+  Buning uchun har bir anonim adminga **boshqalarnikidan farqli unvon** qo'yilishi kerak
+  (Guruh → Tahrirlash → Administratorlar → admin → Unvon). Unvoni yo'q yoki bir xil unvonli adminlar
+  "Anonim admin" deb ko'rsatiladi. Bot guruhda admin bo'lishi kerak.
 
 ## O'rnatish
 
