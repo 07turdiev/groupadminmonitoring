@@ -1,0 +1,231 @@
+import asyncio
+import logging
+import time
+from datetime import datetime, timedelta
+
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ChatType, ParseMode
+from aiogram.filters import Command, CommandStart
+from aiogram.types import (
+    BotCommand,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeDefault,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
+
+import config
+import db
+from reports import build_report
+
+log = logging.getLogger("monitor")
+router = Router()
+
+GROUP_TYPES = {ChatType.GROUP, ChatType.SUPERGROUP}
+ADMIN_CACHE_TTL = 600
+_admin_cache: dict[int, tuple[float, set[int]]] = {}
+
+
+async def get_admin_ids(bot: Bot, chat_id: int) -> set[int]:
+    cached = _admin_cache.get(chat_id)
+    if cached and cached[0] > time.monotonic():
+        return cached[1]
+    try:
+        members = await bot.get_chat_administrators(chat_id)
+        ids = {m.user.id for m in members if not m.user.is_bot}
+    except Exception:
+        log.exception("Adminlar ro'yxatini olib bo'lmadi: %s", chat_id)
+        ids = cached[1] if cached else set()
+    _admin_cache[chat_id] = (time.monotonic() + ADMIN_CACHE_TTL, ids)
+    return ids
+
+
+def chat_allowed(chat_id: int) -> bool:
+    return not config.ALLOWED_CHATS or chat_id in config.ALLOWED_CHATS
+
+
+def author_id(message: Message) -> int | None:
+    """Xabar muallifi ID si. Anonim admin uchun — guruh ID si. Kanal/bot xabarlari uchun None."""
+    if message.sender_chat:
+        return message.chat.id if message.sender_chat.id == message.chat.id else None
+    if message.from_user and not message.from_user.is_bot:
+        return message.from_user.id
+    return None
+
+
+async def is_admin(bot: Bot, message: Message, uid: int) -> bool:
+    return uid == message.chat.id or uid in await get_admin_ids(bot, message.chat.id)
+
+
+def real_reply(message: Message) -> Message | None:
+    """Forum-guruhlarda mavzudagi oddiy xabar ham mavzu boshiga "reply" bo'lib keladi — uni hisobga olmaymiz."""
+    r = message.reply_to_message
+    if not r or r.forum_topic_created or (message.is_topic_message and r.message_id == message.message_thread_id):
+        return None
+    return r
+
+
+# ---------------------------------------------------------------- tugmalar (faqat SUPER_ADMINS, shaxsiy chatda)
+
+REPORT_BUTTONS = {
+    "📅 Bugun": ("day", False),
+    "📅 Kecha": ("day", True),
+    "🗓 Joriy hafta": ("week", False),
+    "🗓 O'tgan hafta": ("week", True),
+    "📆 Joriy oy": ("month", False),
+    "📆 O'tgan oy": ("month", True),
+}
+ID_BUTTON = "🆔 Mening ID"
+
+MENU = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="📅 Bugun"), KeyboardButton(text="📅 Kecha")],
+        [KeyboardButton(text="🗓 Joriy hafta"), KeyboardButton(text="🗓 O'tgan hafta")],
+        [KeyboardButton(text="📆 Joriy oy"), KeyboardButton(text="📆 O'tgan oy")],
+        [KeyboardButton(text=ID_BUTTON)],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+    input_field_placeholder="Hisobot turini tanlang",
+)
+
+private = F.chat.type == ChatType.PRIVATE
+report_admin = F.from_user.id.in_(set(config.SUPER_ADMINS))
+
+
+@router.message(CommandStart(), private, report_admin)
+async def cmd_start(message: Message) -> None:
+    await message.answer(
+        "🤖 <b>Guruh adminlari monitoringi</b>\n\n"
+        "Bot guruhdagi savollarni va adminlar javoblarini (reply) hisoblab boradi.\n"
+        "Kerakli hisobotni pastdagi tugmalardan tanlang.",
+        reply_markup=MENU,
+    )
+
+
+@router.message(CommandStart(), private)
+async def cmd_start_denied(message: Message) -> None:
+    await message.answer(
+        "⛔ Bu bot faqat belgilangan adminlar uchun.\n"
+        f"Ruxsat olish uchun ID ingizni bot egasiga yuboring: <code>{message.from_user.id}</code>",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@router.message(F.text == ID_BUTTON, private, report_admin)
+async def btn_id(message: Message) -> None:
+    await message.answer(f"Sizning ID: <code>{message.from_user.id}</code>")
+
+
+@router.message(Command("id"), F.chat.type.in_(GROUP_TYPES), report_admin)
+async def cmd_group_id(message: Message) -> None:
+    """Guruh ID sini bilish uchun (REPORT_CHAT_ID / ALLOWED_CHATS ga yozish uchun)."""
+    await message.answer(f"Guruh ID: <code>{message.chat.id}</code>")
+
+
+@router.message(F.text.in_(REPORT_BUTTONS), private, report_admin)
+async def btn_report(message: Message) -> None:
+    kind, previous = REPORT_BUTTONS[message.text]
+    chats = [c for c in db.list_chats() if chat_allowed(c["chat_id"])]
+    if not chats:
+        await message.answer("Hali birorta guruh ma'lumoti yo'q.", reply_markup=MENU)
+    for c in chats:
+        await message.answer(build_report(c["chat_id"], kind, previous), reply_markup=MENU)
+
+
+# ---------------------------------------------------------------- kuzatuv
+
+@router.message(F.chat.type.in_(GROUP_TYPES))
+async def track(message: Message, bot: Bot) -> None:
+    if not chat_allowed(message.chat.id):
+        return
+    uid = author_id(message)
+    if uid is None:
+        return
+
+    db.save_chat(message.chat.id, message.chat.title or str(message.chat.id))
+    if message.from_user and uid == message.from_user.id:
+        db.save_user(uid, message.from_user.full_name, message.from_user.username)
+    else:
+        db.save_user(uid, "Anonim admin", None)
+
+    ts = int(message.date.timestamp())
+
+    if await is_admin(bot, message, uid):
+        reply = real_reply(message)
+        if reply is None:
+            return
+        reply_author = author_id(reply)
+        if reply_author is None or await is_admin(bot, message, reply_author):
+            return  # adminlar o'rtasidagi yozishma yoki bot xabariga javob
+        db.add_reply(message.chat.id, message.message_id, uid, reply.message_id, ts)
+        return
+
+    text = message.text or message.caption or ""
+    if text.startswith("/"):
+        return
+    if config.QUESTION_MODE == "mark" and "?" not in text:
+        return
+    db.add_question(message.chat.id, message.message_id, uid, ts)
+
+
+# ---------------------------------------------------------------- avtomatik hisobotlar
+
+async def send_scheduled(bot: Bot, kinds: list[str]) -> None:
+    targets = [config.REPORT_CHAT_ID] if config.REPORT_CHAT_ID else config.SUPER_ADMINS
+    for c in db.list_chats():
+        if not chat_allowed(c["chat_id"]):
+            continue
+        for kind in kinds:
+            text = build_report(c["chat_id"], kind, previous=True)
+            for target in targets:
+                try:
+                    await bot.send_message(target, text)
+                except Exception:
+                    log.exception("Hisobotni yuborib bo'lmadi: %s", target)
+
+
+async def scheduler(bot: Bot) -> None:
+    hour, minute = map(int, config.REPORT_TIME.split(":"))
+    while True:
+        now = datetime.now(config.TZ)
+        run_at = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if run_at <= now:
+            run_at += timedelta(days=1)
+        await asyncio.sleep((run_at - now).total_seconds())
+
+        kinds = ["day"]
+        if run_at.weekday() == 0:
+            kinds.append("week")
+        if run_at.day == 1:
+            kinds.append("month")
+        log.info("Avtomatik hisobot: %s", kinds)
+        await send_scheduled(bot, kinds)
+
+
+async def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    if not config.BOT_TOKEN:
+        raise SystemExit("BOT_TOKEN .env faylida ko'rsatilmagan")
+
+    bot = Bot(config.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher()
+    dp.include_router(router)
+
+    # Eski buyruqlar menyusini tozalaymiz — endi hammasi tugmalar orqali
+    for scope in (BotCommandScopeDefault(), BotCommandScopeAllGroupChats(), BotCommandScopeAllPrivateChats()):
+        await bot.delete_my_commands(scope=scope)
+    await bot.set_my_commands([BotCommand(command="start", description="Menyu")], scope=BotCommandScopeAllPrivateChats())
+    if not config.SUPER_ADMINS:
+        log.warning("SUPER_ADMINS bo'sh — hech kim hisobot ko'ra olmaydi. .env ga ID larni yozing.")
+
+    asyncio.create_task(scheduler(bot))
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
