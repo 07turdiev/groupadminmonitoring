@@ -45,6 +45,17 @@ Ular botga shaxsiy chatda `/start` yozadi va pastda tugmalar chiqadi:
 - Guruhda hisobot chiqmaydi, shuning uchun mijozlar uni ko'rmaydi. Guruh ID sini bilish uchun
   belgilangan admin guruhda `/id` yozadi.
 
+## Excel hisobot
+
+Har bir hisobot ostida **📥 Excel yuklab olish** tugmasi bor. Faylni faqat `SUPER_ADMINS` oladi va u shaxsiy chatga keladi.
+Faylda 3 ta varaq bor:
+
+- **Umumiy** — har bir admin: nechta savolga javob bergani, jami javob xabarlari, o'rtacha javob vaqti.
+- **Savollar** — har bir savol: kim so'ragan, matni, qaysi admin javob bergan, javob matni, qancha vaqtda javob berilgani, Telegramdagi havolasi. Javobsizlar rangli belgilangan.
+- **Admin javoblari** — har bir admin yozgan barcha javoblar va ular qaysi savolga yozilgani.
+
+Savol va javob matnlari shu funksiya qo'shilgandan keyin saqlana boshlaydi, eski yozuvlarda matn ustuni bo'sh bo'ladi.
+
 ## Avtomatik hisobotlar
 
 Har kuni `REPORT_TIME` da (standart 09:00) `REPORT_CHAT_ID` ga (bo'sh bo'lsa — `SUPER_ADMINS` ga) yuboriladi:

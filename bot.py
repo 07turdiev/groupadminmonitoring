@@ -2,6 +2,7 @@ import asyncio
 import logging
 import time
 from datetime import datetime, timedelta
+from html import escape
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -12,6 +13,10 @@ from aiogram.types import (
     BotCommandScopeAllGroupChats,
     BotCommandScopeAllPrivateChats,
     BotCommandScopeDefault,
+    BufferedInputFile,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
@@ -20,6 +25,7 @@ from aiogram.types import (
 
 import config
 import db
+from excel import build_excel
 from reports import build_report
 
 log = logging.getLogger("monitor")
@@ -127,6 +133,11 @@ async def cmd_group_id(message: Message) -> None:
     await message.answer(f"Guruh ID: <code>{message.chat.id}</code>")
 
 
+def excel_kb(chat_id: int, kind: str, previous: bool) -> InlineKeyboardMarkup:
+    data = f"xl:{kind}:{int(previous)}:{chat_id}"
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📥 Excel yuklab olish", callback_data=data)]])
+
+
 @router.message(F.text.in_(REPORT_BUTTONS), private, report_admin)
 async def btn_report(message: Message) -> None:
     kind, previous = REPORT_BUTTONS[message.text]
@@ -134,10 +145,40 @@ async def btn_report(message: Message) -> None:
     if not chats:
         await message.answer("Hali birorta guruh ma'lumoti yo'q.", reply_markup=MENU)
     for c in chats:
-        await message.answer(build_report(c["chat_id"], kind, previous), reply_markup=MENU)
+        await message.answer(build_report(c["chat_id"], kind, previous), reply_markup=excel_kb(c["chat_id"], kind, previous))
+
+
+@router.callback_query(F.data.startswith("xl:"))
+async def cb_excel(call: CallbackQuery) -> None:
+    if call.from_user.id not in config.SUPER_ADMINS:
+        await call.answer("⛔ Ruxsat yo'q", show_alert=True)
+        return
+    _, kind, previous, chat_id = call.data.split(":")
+    await call.answer("Excel tayyorlanmoqda...")
+    content, filename = build_excel(int(chat_id), kind, previous == "1")
+    # Guruhdagi avtomatik hisobotdan bosilsa ham fayl shaxsiy chatga boradi
+    await call.bot.send_document(
+        call.from_user.id,
+        BufferedInputFile(content, filename),
+        caption=f"👥 {escape(db.chat_title(int(chat_id)))}",
+    )
 
 
 # ---------------------------------------------------------------- kuzatuv
+
+MEDIA_NAMES = {
+    "photo": "rasm", "video": "video", "voice": "ovozli xabar", "video_note": "video xabar",
+    "document": "fayl", "audio": "audio", "sticker": "stiker", "animation": "GIF",
+    "location": "joylashuv", "contact": "kontakt", "poll": "so'rovnoma",
+}
+
+
+def message_text(message: Message) -> str:
+    text = message.text or message.caption or ""
+    if message.content_type != "text":
+        media = MEDIA_NAMES.get(message.content_type, message.content_type)
+        text = f"[{media}] {text}".strip()
+    return text
 
 @router.message(F.chat.type.in_(GROUP_TYPES))
 async def track(message: Message, bot: Bot) -> None:
@@ -162,7 +203,7 @@ async def track(message: Message, bot: Bot) -> None:
         reply_author = author_id(reply)
         if reply_author is None or await is_admin(bot, message, reply_author):
             return  # adminlar o'rtasidagi yozishma yoki bot xabariga javob
-        db.add_reply(message.chat.id, message.message_id, uid, reply.message_id, ts)
+        db.add_reply(message.chat.id, message.message_id, uid, reply.message_id, ts, message_text(message))
         return
 
     text = message.text or message.caption or ""
@@ -170,7 +211,7 @@ async def track(message: Message, bot: Bot) -> None:
         return
     if config.QUESTION_MODE == "mark" and "?" not in text:
         return
-    db.add_question(message.chat.id, message.message_id, uid, ts)
+    db.add_question(message.chat.id, message.message_id, uid, ts, message_text(message))
 
 
 # ---------------------------------------------------------------- avtomatik hisobotlar
@@ -184,7 +225,7 @@ async def send_scheduled(bot: Bot, kinds: list[str]) -> None:
             text = build_report(c["chat_id"], kind, previous=True)
             for target in targets:
                 try:
-                    await bot.send_message(target, text)
+                    await bot.send_message(target, text, reply_markup=excel_kb(c["chat_id"], kind, True))
                 except Exception:
                     log.exception("Hisobotni yuborib bo'lmadi: %s", target)
 
